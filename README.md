@@ -13,7 +13,7 @@
 
 4个AI Agent分工协作，完成企业知识的全生命周期管理：文档解析 → 知识抽取 → 智能问答 → 增量更新
 
-[快速开始](#-快速开始) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [API文档](#-api-接口) · [面试资料](#-面试资料)
+[快速开始](#-快速开始) · [系统架构](#-系统架构) · [功能演示](#-功能演示) · [API文档](#-api-接口) 
 
 </div>
 
@@ -440,9 +440,6 @@ AgentKnowledgeHub/
 ├── uploads/                           ← 默认文件上传目录
 │
 ├── doc/                               ← 项目文档资料
-│   ├── 
-│   └── 
-│
 ├── docs/                              ← 技术文档目录
 │   ├── architecture.md                ← 架构设计详解（每个决策的理由）
 │   ├── project-plan.md               ← 项目规划方案
@@ -472,7 +469,6 @@ AgentKnowledgeHub/
 │   ├── uploads/                       ← 文档上传目录
 │   ├── Dockerfile                     ← Python服务容器化
 │   ├── requirements.txt               ← Python依赖
-│   ├── .env                           ← 环境变量配置
 │   └── .env.example                   ← 环境变量模板
 │
 └── fontend/                           ← 前端应用
