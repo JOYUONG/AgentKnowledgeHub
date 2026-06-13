@@ -524,9 +524,6 @@ AgentKnowledgeHub/
 │
 ├── README.md                          ← 你正在看的这个文件
 ├── docker-compose.yml                 ← 一键启动所有依赖服务（Neo4j + ChromaDB + Kafka + MongoDB）
-├── memory_service.py                  ← 记忆服务独立模块
-├── rag-v6.0.py                        ← RAG核心实现
-├── plan.txt                           ← 项目规划文档
 ├── uploads/                           ← 默认文件上传目录
 │
 ├── doc/                               ← 项目文档资料
