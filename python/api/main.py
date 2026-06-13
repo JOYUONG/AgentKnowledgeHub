@@ -20,6 +20,7 @@ load_dotenv()
 
 import os
 import shutil
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -42,38 +43,54 @@ memory_service = MemoryService()
 doc_parser = DocParserAgent()
 extractor = KnowledgeExtractAgent()
 workflows: dict[str, Any] = {}
+mongo_client = None
 
-
+# 初始化知识图谱和工作流
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    os.makedirs(settings.upload_dir, exist_ok=True)
+    """初始化知识图谱和工作流"""
+    global mongo_client
+    os.makedirs(settings.upload_dir, exist_ok=True)   # 确保上传目录存在
     try:
-        await vector_store.init()
+        await vector_store.init()    # 初始化向量存储
     except Exception:
         pass
     try:
-        await knowledge_graph.init()
+        await knowledge_graph.init()    # 初始化知识图谱
     except Exception:
         pass
-    workflows.update(
+
+    # 初始化 MongoDB checkpointer
+    from pymongo import MongoClient
+    from langgraph.checkpoint.mongodb import MongoDBSaver
+    mongo_client = MongoClient(settings.mongodb_uri)
+    checkpointer = MongoDBSaver(
+        client=mongo_client,
+        db_name=settings.mongodb_database,
+    )
+
+    workflows.update(                   # 初始化知识图谱工作流
         build_knowledge_graph_workflow(
-            vector_store=vector_store, 
+            vector_store=vector_store,
             knowledge_graph=knowledge_graph,
-            memory_service=memory_service
+            memory_service=memory_service,
+            checkpointer=checkpointer,
         )
     )
     yield
     await knowledge_graph.close()
+    if mongo_client:
+        mongo_client.close()
 
 
-app = FastAPI(
+app = FastAPI(         # 初始化FastAPI应用
     title="AgentKnowledgeHub — 多Agent企业知识管理系统",
     description="支持多模态RAG、知识图谱、增量更新的企业级知识管理 API",
     version="1.0.0",
     lifespan=lifespan,
 )
 
-app.add_middleware(
+app.add_middleware(    # 添加CORS中间件，允许跨域请求
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
@@ -84,13 +101,15 @@ app.add_middleware(
 
 # ── Request / Response Models ────────────────────────────────
 
-class QuestionRequest(BaseModel):
+class QuestionRequest(BaseModel):  # 问答请求模型
+    """问答请求模型"""
     question: str
     session_id: str | None = None
     user_id: str | None = None
 
 
-class QuestionResponse(BaseModel):
+class QuestionResponse(BaseModel):  # 问答响应模型
+    """问答响应模型"""
     question: str
     answer: str
     confidence: float
@@ -99,7 +118,8 @@ class QuestionResponse(BaseModel):
     reasoning_steps: list[str]
 
 
-class IngestResponse(BaseModel):
+class IngestResponse(BaseModel):  # 文档入库响应模型
+    """文档入库响应模型"""
     file_name: str
     chunks_count: int
     entities_count: int
@@ -107,17 +127,20 @@ class IngestResponse(BaseModel):
     status: str
 
 
-class StatsResponse(BaseModel):
+class StatsResponse(BaseModel):  # 统计响应模型
+    """统计响应模型"""
     vector_store: dict[str, Any]
     knowledge_graph: dict[str, Any]
 
 
-class UpdateRequest(BaseModel):
+class UpdateRequest(BaseModel):  # 更新请求模型
+    """更新请求模型"""
     file_path: str
     change_type: str = "modified"
 
 
-class UpdateResponse(BaseModel):
+class UpdateResponse(BaseModel):  # 更新响应模型
+    """更新响应模型"""
     file_path: str
     vectors_added: int
     vectors_deleted: int
@@ -128,42 +151,36 @@ class UpdateResponse(BaseModel):
 
 
 # ── Ingest Endpoints ─────────────────────────────────────────
-
+# 文档入库接口
 @app.post("/api/ingest/upload", response_model=IngestResponse, tags=["文档入库"])
 async def upload_document(file: UploadFile = File(...)):
-    """上传并解析文档，自动入库到向量库和知识图谱"""
+    """上传并解析文档，自动入库到向量库和知识图谱（通过 ingest workflow + checkpoint）"""
     import logging
     logger = logging.getLogger(__name__)
-    
-    save_path = os.path.join(settings.upload_dir, file.filename or "unknown")
+
+    save_path = os.path.join(settings.upload_dir, file.filename or "unknown")    # 上传文件保存路径
     with open(save_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        shutil.copyfileobj(file.file, f)    # 复制文件内容到保存路径
 
     try:
-        logger.info(f"开始解析文档: {save_path}")
-        chunks = await doc_parser.parse_batch([save_path])
-        logger.info(f"文档解析完成，共 {len(chunks)} 个块")
-        
-        logger.info("开始知识提取")
-        extractions = await extractor.extract(chunks)
-        logger.info(f"知识提取完成，共 {len(extractions)} 个提取结果")
-        
-        if vector_store:
-            logger.info("开始存储向量")
-            await vector_store.add_chunks(chunks)
-            logger.info("向量存储完成")
-        
-        if knowledge_graph:
-            logger.info("开始存储知识图谱")
-            for ext in extractions:
-                for ent in ext.entities:
-                    await knowledge_graph.upsert_entity(ent)
-                for rel in ext.relations:
-                    await knowledge_graph.add_relation(rel)
-            logger.info("知识图谱存储完成")
+        ingest_wf = workflows.get("ingest")
+        if not ingest_wf:
+            raise HTTPException(status_code=503, detail="Ingest workflow not initialized")
 
-        total_entities = sum(len(e.entities) for e in extractions)
-        total_relations = sum(len(e.relations) for e in extractions)
+        thread_id = f"ingest-{file.filename}"
+        request_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+
+        logger.info(f"开始入库文档: {save_path}, thread_id={thread_id}")
+        result = await ingest_wf.ainvoke(
+            {"file_paths": [save_path], "request_id": request_id},
+            config=config,
+        )
+
+        chunks = result.get("chunks", [])
+        extractions = result.get("extractions", [])
+        total_entities = sum(len(e.entities) for e in extractions) if extractions else 0
+        total_relations = sum(len(e.relations) for e in extractions) if extractions else 0
 
         return IngestResponse(
             file_name=file.filename or "unknown",
@@ -225,26 +242,33 @@ async def delete_document(file_name: str):
 @app.post("/api/qa/ask", response_model=QuestionResponse, tags=["智能问答"])
 async def ask_question(req: QuestionRequest):
     """智能问答 — 混合检索 + 知识图谱推理 + 记忆系统"""
-    qa_wf = workflows.get("qa")
+    qa_wf = workflows.get("qa")      ### 从工作流字典，获取智能问答工作流
     if not qa_wf:
         raise HTTPException(status_code=503, detail="QA workflow not initialized")
 
-    inputs = {"question": req.question}
-    if req.session_id:
-        inputs["session_id"] = req.session_id
-    if req.user_id:
-        inputs["user_id"] = req.user_id
+    thread_id = req.session_id or str(uuid.uuid4())
+    request_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
 
-    result = await qa_wf.ainvoke(inputs)
-    qa_result = result.get("result")
+    inputs = {
+        "question": req.question,
+        "request_id": request_id,
+    }     # 初始化输入参数，包含问题和幂等 ID
+    if req.session_id:
+        inputs["session_id"] = req.session_id    # 如果提供了会话 ID，添加到输入参数
+    if req.user_id:
+        inputs["user_id"] = req.user_id    # 如果提供了用户 ID，添加到输入参数
+
+    result = await qa_wf.ainvoke(inputs, config=config)    # 调用智能问答工作流，带 thread_id 支持 checkpoint 恢复
+    qa_result = result.get("result")     # 从工作流结果中提取问答结果
     if not qa_result:
         raise HTTPException(status_code=500, detail="QA failed")
 
-    return QuestionResponse(
-        question=qa_result.question,
-        answer=qa_result.answer,
-        confidence=qa_result.confidence,
-        intent=qa_result.intent.value,
+    return QuestionResponse(        # 返回问答结果
+        question=qa_result.question,     # 问答结果中的问题
+        answer=qa_result.answer,       # 问答结果中的答案 
+        confidence=qa_result.confidence,  # 问答结果中的置信度
+        intent=qa_result.intent.value,    # 问答结果中的意图
         sources=[
             {"content": c.content[:200], "source": c.source, "score": c.score, "type": c.retrieval_type}
             for c in qa_result.contexts
@@ -266,15 +290,22 @@ async def get_stats():
 @app.post("/api/admin/update", response_model=UpdateResponse, tags=["系统管理"])
 async def trigger_update(req: UpdateRequest):
     """手动触发知识更新"""
-    update_wf = workflows.get("update")
+    update_wf = workflows.get("update")     ### 从工作流字典，获取知识更新工作流
     if not update_wf:
         raise HTTPException(status_code=503, detail="Update workflow not initialized")
+
+    thread_id = f"update-{req.file_path}"
+    request_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
 
     change = DocumentChange(
         file_path=req.file_path,
         change_type=ChangeType(req.change_type),
     )
-    result = await update_wf.ainvoke({"changes": [change]})
+    result = await update_wf.ainvoke(
+        {"changes": [change], "request_id": request_id},
+        config=config,
+    )
     results = result.get("results", [])
     if not results:
         raise HTTPException(status_code=500, detail="Update failed")
@@ -293,13 +324,15 @@ async def trigger_update(req: UpdateRequest):
 
 # ── Memory Endpoints ─────────────────────────────────────────
 
-class UserProfileRequest(BaseModel):
+class UserProfileRequest(BaseModel):  # 用户配置请求模型
+    """用户配置请求模型"""
     user_id: str
     name: str | None = None
     background: str | None = None
     preferences: dict | None = None
 
-class UserProfileResponse(BaseModel):
+class UserProfileResponse(BaseModel):  # 用户配置响应模型
+    """用户配置响应模型"""
     user_id: str
     name: str
     background: str
@@ -308,26 +341,30 @@ class UserProfileResponse(BaseModel):
     last_active: str
     created_at: str
 
-class PersonalityRequest(BaseModel):
+class PersonalityRequest(BaseModel):  # 人格配置请求模型
+    """人格配置请求模型"""
     user_id: str
     warmth: float | None = None
     expertise: float | None = None
     humor: float | None = None
     empathy: float | None = None
 
-class PersonalityResponse(BaseModel):
+class PersonalityResponse(BaseModel):  # 人格配置响应模型
+    """人格配置响应模型"""
     user_id: str
     warmth: float
     expertise: float
     humor: float
     empathy: float
 
-class MemoryRetrieveRequest(BaseModel):
+class MemoryRetrieveRequest(BaseModel):  # 记忆检索请求模型
+    """记忆检索请求模型"""
     query: str
     user_id: str = "default_user"
     top_k: int = 5
 
-class MemoryEventResponse(BaseModel):
+class MemoryEventResponse(BaseModel):  # 记忆事件响应模型
+    """记忆事件响应模型"""
     session_id: str
     timestamp: str
     user_input: str
@@ -338,13 +375,15 @@ class MemoryEventResponse(BaseModel):
 
 # ── Conversation Models ───────────────────────────────────────
 
-class MessageRequest(BaseModel):
+class MessageRequest(BaseModel):  # 消息请求模型
+    """消息请求模型"""
     role: str  # user | assistant | system
     content: str
     message_id: str | None = None
     metadata: dict | None = None
 
-class MessageResponse(BaseModel):
+class MessageResponse(BaseModel):  # 消息响应模型
+    """消息响应模型"""
     id: str
     session_id: str
     role: str
@@ -352,13 +391,15 @@ class MessageResponse(BaseModel):
     timestamp: str
     metadata: dict
 
-class ConversationRequest(BaseModel):
+class ConversationRequest(BaseModel):  # 对话请求模型
+    """对话请求模型"""
     session_id: str
     user_id: str | None = None
     title: str | None = None
     metadata: dict | None = None
 
-class ConversationResponse(BaseModel):
+class ConversationResponse(BaseModel):  # 对话响应模型
+    """对话响应模型"""
     session_id: str
     user_id: str
     title: str
@@ -367,19 +408,22 @@ class ConversationResponse(BaseModel):
     updated_at: str
     metadata: dict
 
-class ConversationListResponse(BaseModel):
+class ConversationListResponse(BaseModel):  # 对话列表响应模型
+    """对话列表响应模型"""
     conversations: list[ConversationResponse]
     total: int
 
-class ConversationSearchRequest(BaseModel):
+class ConversationSearchRequest(BaseModel):  # 对话搜索请求模型
+    """对话搜索请求模型"""
     query: str
     user_id: str | None = None
     limit: int = 20
 
-class DeleteMessageRequest(BaseModel):
+class DeleteMessageRequest(BaseModel):  # 删除消息请求模型
+    """删除消息请求模型"""
     message_id: str
 
-@app.get("/api/memory/profile/{user_id}", response_model=UserProfileResponse, tags=["记忆管理"])
+@app.get("/api/memory/profile/{user_id}", response_model=UserProfileResponse, tags=["记忆管理"])   # 获取用户画像接口
 async def get_user_profile(user_id: str):
     """获取用户画像"""
     profile = await memory_service.get_user_profile(user_id)
@@ -395,7 +439,7 @@ async def get_user_profile(user_id: str):
         created_at=profile.created_at,
     )
 
-@app.post("/api/memory/profile", response_model=UserProfileResponse, tags=["记忆管理"])
+@app.post("/api/memory/profile", response_model=UserProfileResponse, tags=["记忆管理"])   # 更新用户画像接口
 async def update_user_profile(req: UserProfileRequest):
     """更新用户画像"""
     profile = await memory_service.get_user_profile(req.user_id)
@@ -410,7 +454,7 @@ async def update_user_profile(req: UserProfileRequest):
     if req.preferences is not None:
         profile.preferences.update(req.preferences)
     
-    await memory_service.update_user_profile(req.user_id, profile)
+    await memory_service.update_user_profile(req.user_id, profile)   # 更新用户画像
     return UserProfileResponse(
         user_id=profile.user_id,
         name=profile.name,
@@ -421,7 +465,7 @@ async def update_user_profile(req: UserProfileRequest):
         created_at=profile.created_at,
     )
 
-@app.get("/api/memory/personality/{user_id}", response_model=PersonalityResponse, tags=["记忆管理"])
+@app.get("/api/memory/personality/{user_id}", response_model=PersonalityResponse, tags=["记忆管理"])   # 获取AI个性参数接口
 async def get_personality(user_id: str):
     """获取AI个性参数"""
     personality = await memory_service.get_personality(user_id)
@@ -433,7 +477,7 @@ async def get_personality(user_id: str):
         empathy=personality.empathy,
     )
 
-@app.post("/api/memory/personality", response_model=PersonalityResponse, tags=["记忆管理"])
+@app.post("/api/memory/personality", response_model=PersonalityResponse, tags=["记忆管理"])   # 更新AI个性参数接口
 async def update_personality(req: PersonalityRequest):
     """更新AI个性参数"""
     personality = await memory_service.get_personality(req.user_id)
@@ -456,7 +500,7 @@ async def update_personality(req: PersonalityRequest):
         empathy=personality.empathy,
     )
 
-@app.post("/api/memory/retrieve", response_model=list[MemoryEventResponse], tags=["记忆管理"])
+@app.post("/api/memory/retrieve", response_model=list[MemoryEventResponse], tags=["记忆管理"])   # 检索相关历史记忆接口
 async def retrieve_memory(req: MemoryRetrieveRequest):
     """检索相关历史记忆"""
     events = await memory_service.retrieve_long_term(req.query, req.top_k)
@@ -472,7 +516,7 @@ async def retrieve_memory(req: MemoryRetrieveRequest):
 
 # ── Conversation Endpoints ────────────────────────────────────
 
-@app.post("/api/conversations", response_model=ConversationResponse, tags=["对话管理"])
+@app.post("/api/conversations", response_model=ConversationResponse, tags=["对话管理"])   # 创建新对话会话接口 
 async def create_conversation(req: ConversationRequest):
     """创建新对话会话"""
     conversation = await memory_service.create_conversation(
@@ -491,7 +535,7 @@ async def create_conversation(req: ConversationRequest):
         metadata=conversation.metadata
     )
 
-@app.get("/api/conversations", response_model=list[ConversationResponse], tags=["对话管理"])
+@app.get("/api/conversations", response_model=list[ConversationResponse], tags=["对话管理"])   # 获取所有历史对话列表接口
 async def list_conversations(user_id: str = "", limit: int = 20, offset: int = 0):
     """获取所有历史对话列表"""
     conversations = await memory_service.list_conversations(user_id=user_id, limit=limit, offset=offset)
@@ -505,7 +549,7 @@ async def list_conversations(user_id: str = "", limit: int = 20, offset: int = 0
         metadata=c.metadata
     ) for c in conversations]
 
-@app.post("/api/conversations/search", response_model=list[ConversationResponse], tags=["对话管理"])
+@app.post("/api/conversations/search", response_model=list[ConversationResponse], tags=["对话管理"])   # 搜索对话接口
 async def search_conversations(req: ConversationSearchRequest):
     """搜索对话（按标题或消息内容）"""
     conversations = await memory_service.search_conversations(
@@ -523,7 +567,7 @@ async def search_conversations(req: ConversationSearchRequest):
         metadata=c.metadata
     ) for c in conversations]
 
-@app.get("/api/conversations/{session_id}", response_model=ConversationResponse, tags=["对话管理"])
+@app.get("/api/conversations/{session_id}", response_model=ConversationResponse, tags=["对话管理"])   # 获取单个会话详情接口
 async def get_conversation(session_id: str):
     """获取单个会话详情（继续对话）"""
     conversation = await memory_service.get_conversation(session_id)
@@ -546,7 +590,7 @@ async def get_conversation(session_id: str):
         metadata=conversation.metadata
     )
 
-@app.post("/api/conversations/{session_id}/messages", response_model=MessageResponse, tags=["对话管理"])
+@app.post("/api/conversations/{session_id}/messages", response_model=MessageResponse, tags=["对话管理"])   # 添加消息到会话接口
 async def add_message(session_id: str, req: MessageRequest):
     """添加消息到会话（存储对话）"""
     message = await memory_service.save_message(
@@ -565,7 +609,7 @@ async def add_message(session_id: str, req: MessageRequest):
         metadata=message.metadata
     )
 
-@app.put("/api/conversations/{session_id}/title", tags=["对话管理"])
+@app.put("/api/conversations/{session_id}/title", tags=["对话管理"])   # 更新会话标题接口
 async def update_conversation_title(session_id: str, title: str):
     """更新会话标题"""
     success = await memory_service.update_conversation_title(session_id, title)
@@ -581,7 +625,7 @@ async def delete_conversation(session_id: str):
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"success": True, "message": "Conversation deleted"}
 
-@app.delete("/api/conversations/{session_id}/messages/{message_id}", tags=["对话管理"])
+@app.delete("/api/conversations/{session_id}/messages/{message_id}", tags=["对话管理"])   # 删除单条消息接口
 async def delete_message(session_id: str, message_id: str):
     """删除单条消息"""
     success = await memory_service.delete_message(session_id, message_id)
@@ -589,11 +633,13 @@ async def delete_message(session_id: str, message_id: str):
         raise HTTPException(status_code=404, detail="Message not found")
     return {"success": True, "message": "Message deleted"}
 
-@app.get("/api/health", tags=["系统管理"])
+@app.get("/api/health", tags=["系统管理"])      # 健康检查接口
 async def health():
+    """健康检查"""
     return {"status": "ok", "service": "AgentKnowledgeHub"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api.main:app", host=settings.api_host, port=settings.api_port, reload=True)
+    uvicorn.run("api.main:app", host=settings.api_host, port=settings.api_port, reload=True)   # 启动API服务
+    print(f"API service is running on {settings.api_host}:{settings.api_port}")
